@@ -1,10 +1,10 @@
 import {createReadStream} from 'fs'
-import Debug from 'debug'
-import apkParser from 'node-apk-parser'
+import ApkReader from 'adbkit-apkreader'
 import {androidpublisher} from 'googleapis'
 import assert from 'assert'
 
-var debug = Debug('playup')
+// var debug = Debug('playup')
+var debug = console.log
 var publisher = androidpublisher('v2')
 var versionCodes = []
 
@@ -30,6 +30,7 @@ export default class Upload {
       .then(() => this.uploadOBBs())
       .then(() => this.assignTrack())
       .then(() => this.sendRecentChanges())
+      .then(() => this.checkForSuperseededTracks())
       .then(() => this.commitChanges())
       .then(() => {
         return {
@@ -41,15 +42,19 @@ export default class Upload {
 
   parseManifest () {
     debug('> Parsing manifest')
-    // Wrapping in promise because apkParser throws in case of error
-    return Promise.resolve().then(() => {
-      var reader = apkParser.readFile(this.apk[0])
-      var manifest = reader.readManifestSync()
-      this.packageName = manifest.package
-      this.versionCode = manifest.versionCode
-      debug('> Detected package name %s', this.packageName)
-      debug('> Detected version code %d', this.versionCode)
-    })
+
+    return ApkReader.open(this.apk[0])
+      .then(reader => reader.readManifest())
+      .then(manifest => {
+        this.packageName = manifest.package
+        this.versionCode = manifest.versionCode
+        debug('> Detected package name %s', this.packageName)
+        debug('> Detected version code %d', this.versionCode)
+        return {
+          package: manifest.package,
+          versionCode: manifest.versionCode
+        }
+      })
   }
 
   authenticate () {
@@ -107,11 +112,8 @@ export default class Upload {
     if (!this.obbs || !Array.isArray(this.obbs) || !this.obbs.length) return Promise.resolve()
 
     debug('> Uploading %d expansion file(s)', this.obbs.length)
-    let current = Promise.resolve()
-
     return Promise.all(this.obbs.map(obb => {
-      current = current.then(this.uploadOBB(obb))
-      return current
+      return this.uploadOBB(obb)
     }))
   }
 
@@ -158,10 +160,8 @@ export default class Upload {
     if (!this.recentChanges || !Object.keys(this.recentChanges).length) return Promise.resolve()
     debug('> Adding what changed')
 
-    let current = Promise.resolve()
     return Promise.all(Object.keys(this.recentChanges).map(lang => {
-      current = current.then(this.sendRecentChange(lang))
-      return current
+      return this.sendRecentChange(lang)
     }))
   }
 
@@ -185,6 +185,55 @@ export default class Upload {
     })
   }
 
+  checkForSuperseededTracks () {
+    debug('> Checking version')
+    return new Promise((done, reject) => {
+      publisher.edits.tracks.list({
+       editId: this.editId,
+       packageName: this.packageName,
+       auth: this.client
+     }, (err, commit) => {
+       if (err) return reject(err)
+       done(this.setTrackSuperseeded(commit))
+     })
+    })
+  }
+
+  setTrackSuperseeded (trackList) {
+    debug('> Set superseded APKs')
+
+    let tracksToSuperseed = trackList.tracks.filter((track) => {
+      return ((Upload.tracks.findIndex((trackName) => {return (trackName === track.track)}) < Upload.tracks.findIndex(((trackName) => {return (trackName === this.track)}))) &&
+       (Boolean(track.versionCodes.find((versionCode) => {return (versionCode < this.versionCode)}))))
+    })
+    return Promise.all(this.getSuperseedPromises(tracksToSuperseed))
+       .then(() => {debug('> Superseded APKs were set')})
+  }
+
+  getSuperseedPromises (tracksToSuperseed) {
+    let superseedPromises = []
+    tracksToSuperseed.forEach((track) => {
+      superseedPromises.push(new Promise((done, reject) => {
+        return publisher.edits.tracks.update({
+          editId: this.editId,
+          packageName: this.packageName,
+          track: track.track,
+          resource: {
+            track: track.track,
+            versionCodes: [],
+            userFraction: 1.0
+      },
+      auth: this.client
+     }, (err, commit) => {
+       if (err) return reject(err)
+       debug(`> APKs with versions: ${track.versionCodes} in the ${track.track} track were set to superseded state`)
+       done()
+     })
+      }))
+    })
+    return superseedPromises
+  }
+
   commitChanges () {
     debug('> Commiting changes')
     return new Promise((done, reject) => {
@@ -192,7 +241,7 @@ export default class Upload {
         editId: this.editId,
         packageName: this.packageName,
         auth: this.client
-      }, function (err, commit) {
+      }, (err, commit) => {
         if (err) return reject(err)
         debug('> Commited changes')
         done()
