@@ -145,7 +145,7 @@ The params object will add aditional information to this release. Currently, it 
  Type: string
  Default: `'alpha'`
 
- Specify track for this release. Can be alpha, beta, production or rollout.
+ Specify track for this release. Can be internal, alpha, beta, production or rollout.
 
 ##### recentChanges
 
